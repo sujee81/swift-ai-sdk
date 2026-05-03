@@ -846,6 +846,55 @@ struct XAIResponsesLanguageModelTests {
         }))
     }
 
+    @Test("streams code_interpreter code input and included output as result")
+    func doStreamCodeInterpreterToolCallAndResult() async throws {
+        let chunks = [
+            #"{"type":"response.created","response":{"id":"resp_123","object":"response","model":"grok-4-fast","status":"in_progress","output":[]}}"#,
+            #"{"type":"response.output_item.added","output_index":0,"item":{"type":"code_interpreter_call","id":"ci_stream_123","status":"in_progress","code":"","outputs":[]}}"#,
+            #"{"type":"response.code_interpreter_call.in_progress","item_id":"ci_stream_123","output_index":0}"#,
+            #"{"type":"response.code_interpreter_call_code.delta","item_id":"ci_stream_123","output_index":0,"delta":"print(\"hi\")"}"#,
+            #"{"type":"response.code_interpreter_call_code.done","item_id":"ci_stream_123","output_index":0,"code":"print(\"hi\")"}"#,
+            #"{"type":"response.code_interpreter_call.completed","item_id":"ci_stream_123","output_index":0}"#,
+            #"{"type":"response.output_item.done","output_index":0,"item":{"type":"code_interpreter_call","id":"ci_stream_123","status":"completed","code":"print(\"hi\")","outputs":[{"type":"logs","logs":"{\"stdout\":\"hi\\n\",\"stderr\":\"\",\"output_files\":{},\"error\":\"\",\"ret\":\"\"}"}]}}"#,
+            #"{"type":"response.done","response":{"id":"resp_123","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#
+        ]
+
+        let events = Self.sseEvents(chunks)
+        let httpResponse = Self.makeHTTPResponse(headers: ["Content-Type": "text/event-stream"])
+
+        let model = Self.makeModel(fetch: { _ in
+            FetchResponse(body: .stream(Self.makeStream(from: events)), urlResponse: httpResponse)
+        })
+
+        let tools: [LanguageModelV3Tool] = [
+            .provider(.init(id: "xai.code_execution", name: "code_execution", args: [:]))
+        ]
+
+        let result = try await model.doStream(options: .init(prompt: Self.testPrompt, tools: tools))
+        let parts = try await Self.collect(result.stream)
+
+        let input = parts.compactMap { part -> String? in
+            guard case .toolInputDelta(let id, let delta, _) = part, id == "ci_stream_123" else {
+                return nil
+            }
+            return delta
+        }.joined()
+
+        #expect(input == #"{"code":"print(\"hi\")"}"#)
+        #expect(parts.contains(where: { if case .toolInputEnd(let id, _) = $0 { return id == "ci_stream_123" } else { return false } }))
+        #expect(parts.contains(where: { if case .toolCall(let call) = $0 { return call.toolCallId == "ci_stream_123" && call.toolName == "code_execution" && call.input == #"{"code":"print(\"hi\")"}"# && call.providerExecuted == true } else { return false } }))
+        #expect(parts.contains(where: { part in
+            guard case .toolResult(let result) = part,
+                  result.toolCallId == "ci_stream_123",
+                  result.toolName == "code_execution",
+                  case .object(let output) = result.result,
+                  case .array(let outputs)? = output["outputs"] else {
+                return false
+            }
+            return outputs.count == 1
+        }))
+    }
+
     @Test("does not emit duplicate text-delta from output_item.done after streaming")
     func doStreamNoDuplicateTextDelta() async throws {
         let chunks = [

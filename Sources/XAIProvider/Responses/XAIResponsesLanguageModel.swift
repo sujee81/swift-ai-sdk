@@ -402,6 +402,28 @@ public final class XAIResponsesLanguageModel: LanguageModelV3 {
                             case .responseFunctionCallArgumentsDone:
                                 break
 
+                            case .responseCodeInterpreterCallCodeDelta(_, let outputIndex, let delta):
+                                if let tracked = ongoingToolCalls[outputIndex] ?? nil {
+                                    continuation.yield(.toolInputDelta(
+                                        id: tracked.toolCallId,
+                                        delta: xaiEscapeJSONString(delta),
+                                        providerMetadata: nil
+                                    ))
+                                }
+
+                            case .responseCodeInterpreterCallCodeDone(_, let outputIndex, let code):
+                                if let tracked = ongoingToolCalls[outputIndex] ?? nil {
+                                    continuation.yield(.toolInputDelta(id: tracked.toolCallId, delta: "\"}", providerMetadata: nil))
+                                    continuation.yield(.toolInputEnd(id: tracked.toolCallId, providerMetadata: nil))
+                                    continuation.yield(.toolCall(LanguageModelV3ToolCall(
+                                        toolCallId: tracked.toolCallId,
+                                        toolName: tracked.toolName,
+                                        input: xaiCodeExecutionInput(arguments: nil, code: code),
+                                        providerExecuted: true
+                                    )))
+                                    ongoingToolCalls[outputIndex] = nil
+                                }
+
                             case .responseOutputItemAdded(let item, let outputIndex):
                                 try await handleOutputItem(
                                     phase: OutputItemPhase.added,
@@ -750,6 +772,22 @@ private func handleOutputItem(
             if shouldEmit && !seenToolCalls.contains(part.id) {
                 seenToolCalls.insert(part.id)
 
+                if (part.type == "code_interpreter_call" || part.type == "code_execution_call"),
+                   phase == .added,
+                   toolInput.isEmpty {
+                    ongoingToolCalls[outputIndex] = (toolName: toolName, toolCallId: part.id)
+                    continuation.yield(.toolInputStart(
+                        id: part.id,
+                        toolName: toolName,
+                        providerMetadata: nil,
+                        providerExecuted: true,
+                        dynamic: nil,
+                        title: nil
+                    ))
+                    continuation.yield(.toolInputDelta(id: part.id, delta: "{\"code\":\"", providerMetadata: nil))
+                    return
+                }
+
                 continuation.yield(.toolInputStart(
                     id: part.id,
                     toolName: toolName,
@@ -942,6 +980,16 @@ private func xaiJSONString(from value: JSONValue) -> String? {
         return nil
     }
     return String(data: data, encoding: .utf8)
+}
+
+private func xaiEscapeJSONString(_ value: String) -> String {
+    guard let data = try? JSONEncoder().encode(JSONValue.string(value)),
+          var string = String(data: data, encoding: .utf8) else {
+        return value
+    }
+    string.removeFirst()
+    string.removeLast()
+    return string
 }
 
 private func isJSONString(_ value: JSONValue) -> Bool {
