@@ -350,7 +350,7 @@ struct XAIResponsesLanguageModelTests {
             reasoningEffort: .high,
             store: false,
             previousResponseId: "resp_456",
-            include: ["file_search_call.results"]
+            include: ["file_search_call.results", "web_search_call.action.sources"]
         )
 
         _ = try await model.doGenerate(options: .init(
@@ -359,7 +359,10 @@ struct XAIResponsesLanguageModelTests {
                 "reasoningEffort": .string(options.reasoningEffort!.rawValue),
                 "store": .bool(false),
                 "previousResponseId": .string("resp_456"),
-                "include": .array([.string("file_search_call.results")])
+                "include": .array([
+                    .string("file_search_call.results"),
+                    .string("web_search_call.action.sources")
+                ])
             ]]
         ))
 
@@ -383,9 +386,52 @@ struct XAIResponsesLanguageModelTests {
             return
         }
         #expect(include.contains(.string("file_search_call.results")))
+        #expect(include.contains(.string("web_search_call.action.sources")))
         #expect(include.contains(.string("reasoning.encrypted_content")))
 
         #expect(dict["reasoning"] == .object(["effort": .string("high")]))
+    }
+
+    @Test("auto-includes hosted tool outputs for xAI Responses tools")
+    func doGenerateAutoIncludesHostedToolOutputs() async throws {
+        let capture = RequestCapture()
+
+        let responseJSON: [String: Any] = [
+            "id": "resp_123",
+            "object": "response",
+            "status": "completed",
+            "model": "grok-4-fast",
+            "output": [],
+            "usage": ["input_tokens": 10, "output_tokens": 5]
+        ]
+
+        let data = try JSONSerialization.data(withJSONObject: responseJSON)
+        let httpResponse = Self.makeHTTPResponse()
+
+        let fetch: FetchFunction = { request in
+            let body: JSONValue? = request.httpBody.flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
+            await capture.store(request: request, body: body)
+            return FetchResponse(body: .data(data), urlResponse: httpResponse)
+        }
+
+        let model = Self.makeModel(fetch: fetch)
+        let tools: [LanguageModelV3Tool] = [
+            .provider(.init(id: "xai.web_search", name: "web_search", args: [:])),
+            .provider(.init(id: "xai.code_execution", name: "code_execution", args: [:]))
+        ]
+
+        _ = try await model.doGenerate(options: .init(prompt: Self.testPrompt, tools: tools))
+
+        let snapshot = await capture.snapshot()
+        guard let body = snapshot.body,
+              case .object(let dict) = body,
+              case .array(let include)? = dict["include"] else {
+            Issue.record("Expected include array")
+            return
+        }
+
+        #expect(include.contains(.string("web_search_call.action.sources")))
+        #expect(include.contains(.string("code_interpreter_call.outputs")))
     }
 
     @Test("warns about unsupported stopSequences")
@@ -574,6 +620,69 @@ struct XAIResponsesLanguageModelTests {
         }
     }
 
+    @Test("web_search tool call and included sources emit tool result")
+    func doGenerateWebSearchToolCallAndResult() async throws {
+        let responseJSON: [String: Any] = [
+            "id": "resp_123",
+            "object": "response",
+            "status": "completed",
+            "model": "grok-4-fast",
+            "output": [[
+                "type": "web_search_call",
+                "id": "ws_123",
+                "status": "completed",
+                "action": [
+                    "type": "search",
+                    "query": "latest xAI news",
+                    "sources": [[
+                        "type": "url",
+                        "url": "https://x.ai/news",
+                        "title": "xAI News"
+                    ]]
+                ]
+            ]],
+            "usage": ["input_tokens": 10, "output_tokens": 5]
+        ]
+
+        let data = try JSONSerialization.data(withJSONObject: responseJSON)
+        let httpResponse = Self.makeHTTPResponse()
+
+        let model = Self.makeModel(fetch: { _ in
+            FetchResponse(body: .data(data), urlResponse: httpResponse)
+        })
+
+        let tools: [LanguageModelV3Tool] = [
+            .provider(.init(id: "xai.web_search", name: "web_search", args: [:]))
+        ]
+
+        let result = try await model.doGenerate(options: .init(prompt: Self.testPrompt, tools: tools))
+
+        #expect(result.content.count == 2)
+        guard case .toolCall(let call) = result.content[0] else {
+            Issue.record("Expected tool-call")
+            return
+        }
+        #expect(call.toolCallId == "ws_123")
+        #expect(call.toolName == "web_search")
+        #expect(call.providerExecuted == true)
+
+        guard case .toolResult(let toolResult) = result.content[1] else {
+            Issue.record("Expected tool-result")
+            return
+        }
+        #expect(toolResult.toolCallId == "ws_123")
+        #expect(toolResult.toolName == "web_search")
+
+        guard case .object(let output) = toolResult.result,
+              case .object(let action)? = output["action"],
+              case .array(let sources)? = output["sources"] else {
+            Issue.record("Expected normalized web search output")
+            return
+        }
+        #expect(action["query"] == .string("latest xAI news"))
+        #expect(sources.count == 1)
+    }
+
     @Test("extracts citations from annotations")
     func doGenerateCitations() async throws {
         let ids = IDGenerator()
@@ -697,6 +806,44 @@ struct XAIResponsesLanguageModelTests {
         #expect(parts.contains(where: { if case .toolInputEnd(let id, _) = $0 { return id == "fs_stream_123" } else { return false } }))
         #expect(parts.contains(where: { if case .toolCall(let call) = $0 { return call.toolCallId == "fs_stream_123" && call.toolName == "file_search" && call.providerExecuted == true } else { return false } }))
         #expect(parts.contains(where: { if case .toolResult(let result) = $0 { return result.toolCallId == "fs_stream_123" && result.toolName == "file_search" } else { return false } }))
+    }
+
+    @Test("streams web_search tool call and included sources as result")
+    func doStreamWebSearchToolCallAndResult() async throws {
+        let chunks = [
+            #"{"type":"response.created","response":{"id":"resp_123","object":"response","model":"grok-4-fast","status":"in_progress","output":[]}}"#,
+            #"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_stream_123","status":"in_progress"}}"#,
+            #"{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_stream_123","status":"completed","action":{"type":"search","query":"latest xAI news","sources":[{"type":"url","url":"https://x.ai/news","title":"xAI News"}]}}}"#,
+            #"{"type":"response.done","response":{"id":"resp_123","object":"response","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}}"#
+        ]
+
+        let events = Self.sseEvents(chunks)
+        let httpResponse = Self.makeHTTPResponse(headers: ["Content-Type": "text/event-stream"])
+
+        let model = Self.makeModel(fetch: { _ in
+            FetchResponse(body: .stream(Self.makeStream(from: events)), urlResponse: httpResponse)
+        })
+
+        let tools: [LanguageModelV3Tool] = [
+            .provider(.init(id: "xai.web_search", name: "web_search", args: [:]))
+        ]
+
+        let result = try await model.doStream(options: .init(prompt: Self.testPrompt, tools: tools))
+        let parts = try await Self.collect(result.stream)
+
+        #expect(parts.contains(where: { if case .toolInputStart(let id, let toolName, _, _, _, _) = $0 { return id == "ws_stream_123" && toolName == "web_search" } else { return false } }))
+        #expect(parts.contains(where: { if case .toolInputEnd(let id, _) = $0 { return id == "ws_stream_123" } else { return false } }))
+        #expect(parts.contains(where: { if case .toolCall(let call) = $0 { return call.toolCallId == "ws_stream_123" && call.toolName == "web_search" && call.providerExecuted == true } else { return false } }))
+        #expect(parts.contains(where: { part in
+            guard case .toolResult(let result) = part,
+                  result.toolCallId == "ws_stream_123",
+                  result.toolName == "web_search",
+                  case .object(let output) = result.result,
+                  case .array(let sources)? = output["sources"] else {
+                return false
+            }
+            return sources.count == 1
+        }))
     }
 
     @Test("does not emit duplicate text-delta from output_item.done after streaming")

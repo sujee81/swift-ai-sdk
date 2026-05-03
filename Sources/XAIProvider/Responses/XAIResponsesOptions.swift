@@ -36,6 +36,14 @@ private let xaiResponsesProviderOptionsJSONSchema: JSONValue = .object([
     "additionalProperties": .bool(true)
 ])
 
+private let allowedXAIResponsesIncludeValues: Set<String> = [
+    "web_search_call.action.sources",
+    "code_interpreter_call.outputs",
+    "file_search_call.results",
+    "reasoning.encrypted_content",
+    "no_inline_citations"
+]
+
 public let xaiLanguageModelResponsesOptionsSchema = FlexibleSchema(
     Schema<XAILanguageModelResponsesOptions>(
         jsonSchemaResolver: { xaiResponsesProviderOptionsJSONSchema },
@@ -106,10 +114,10 @@ public let xaiLanguageModelResponsesOptionsSchema = FlexibleSchema(
                             )
                             return .failure(error: TypeValidationError.wrap(value: item, cause: error))
                         }
-                        if value != "file_search_call.results" {
+                        if !allowedXAIResponsesIncludeValues.contains(value) {
                             let error = SchemaValidationIssuesError(
                                 vendor: "xai",
-                                issues: "include can only contain 'file_search_call.results'"
+                                issues: "include contains unsupported value '\(value)'"
                             )
                             return .failure(error: TypeValidationError.wrap(value: item, cause: error))
                         }
@@ -130,4 +138,3 @@ public let xaiLanguageModelResponsesOptionsSchema = FlexibleSchema(
         }
     )
 )
-

@@ -126,6 +126,8 @@ public final class XAIResponsesLanguageModel: LanguageModelV3 {
                     let toolInput: String
                     if part.type == "custom_tool_call" {
                         toolInput = part.input ?? ""
+                    } else if part.type == "code_interpreter_call" || part.type == "code_execution_call" {
+                        toolInput = xaiCodeExecutionInput(arguments: part.arguments, code: part.code)
                     } else {
                         toolInput = part.arguments ?? ""
                     }
@@ -136,6 +138,22 @@ public final class XAIResponsesLanguageModel: LanguageModelV3 {
                         input: toolInput,
                         providerExecuted: true
                     )))
+
+                    if part.type == "web_search_call",
+                       let output = mapXAIWebSearchOutput(part.action) {
+                        content.append(.toolResult(LanguageModelV3ToolResult(
+                            toolCallId: toolCallId,
+                            toolName: toolName,
+                            result: output
+                        )))
+                    } else if (part.type == "code_interpreter_call" || part.type == "code_execution_call"),
+                              let output = mapXAICodeExecutionOutput(part.outputs) {
+                        content.append(.toolResult(LanguageModelV3ToolResult(
+                            toolCallId: toolCallId,
+                            toolName: toolName,
+                            result: output
+                        )))
+                    }
 
                     continue
                 }
@@ -504,17 +522,19 @@ public final class XAIResponsesLanguageModel: LanguageModelV3 {
         let preparedTools = try await prepareXAIResponsesTools(tools: options.tools, toolChoice: options.toolChoice)
         warnings.append(contentsOf: preparedTools.warnings)
 
-        var includeValues: [String]? = nil
+        var includeValues = Set<String>()
         if let include = providerOptions.include, !include.isEmpty {
-            includeValues = include
+            includeValues.formUnion(include)
+        }
+        if webSearchToolName != nil {
+            includeValues.insert("web_search_call.action.sources")
+        }
+        if codeExecutionToolName != nil {
+            includeValues.insert("code_interpreter_call.outputs")
         }
 
         if providerOptions.store == false {
-            if includeValues == nil {
-                includeValues = ["reasoning.encrypted_content"]
-            } else {
-                includeValues?.append("reasoning.encrypted_content")
-            }
+            includeValues.insert("reasoning.encrypted_content")
         }
 
         var body: [String: JSONValue] = [
@@ -573,8 +593,8 @@ public final class XAIResponsesLanguageModel: LanguageModelV3 {
             body["store"] = .bool(false)
         }
 
-        if let includeValues {
-            body["include"] = .array(includeValues.map(JSONValue.string))
+        if !includeValues.isEmpty {
+            body["include"] = .array(includeValues.sorted().map(JSONValue.string))
         }
 
         if let previousResponseId = providerOptions.previousResponseId {
@@ -655,7 +675,7 @@ private func handleOutputItem(
                     id: part.id,
                     toolName: toolName,
                     providerMetadata: nil,
-                    providerExecuted: nil,
+                    providerExecuted: true,
                     dynamic: nil,
                     title: nil
                 ))
@@ -716,7 +736,14 @@ private func handleOutputItem(
                 toolName = prepared.codeExecutionToolName ?? "code_execution"
             }
 
-            let toolInput = part.type == "custom_tool_call" ? (part.input ?? "") : (part.arguments ?? "")
+            let toolInput: String
+            if part.type == "custom_tool_call" {
+                toolInput = part.input ?? ""
+            } else if part.type == "code_interpreter_call" || part.type == "code_execution_call" {
+                toolInput = xaiCodeExecutionInput(arguments: part.arguments, code: part.code)
+            } else {
+                toolInput = part.arguments ?? ""
+            }
 
             let shouldEmit = part.type == "custom_tool_call" ? (phase == .done) : !seenToolCalls.contains(part.id)
 
@@ -727,7 +754,7 @@ private func handleOutputItem(
                     id: part.id,
                     toolName: toolName,
                     providerMetadata: nil,
-                    providerExecuted: nil,
+                    providerExecuted: true,
                     dynamic: nil,
                     title: nil
                 ))
@@ -739,6 +766,24 @@ private func handleOutputItem(
                     input: toolInput,
                     providerExecuted: true
                 )))
+            }
+
+            if phase == .done {
+                if part.type == "web_search_call",
+                   let output = mapXAIWebSearchOutput(part.action) {
+                    continuation.yield(.toolResult(LanguageModelV3ToolResult(
+                        toolCallId: part.id,
+                        toolName: toolName,
+                        result: output
+                    )))
+                } else if (part.type == "code_interpreter_call" || part.type == "code_execution_call"),
+                          let output = mapXAICodeExecutionOutput(part.outputs) {
+                    continuation.yield(.toolResult(LanguageModelV3ToolResult(
+                        toolCallId: part.id,
+                        toolName: toolName,
+                        result: output
+                    )))
+                }
             }
 
             return
@@ -758,7 +803,7 @@ private func handleOutputItem(
                 id: part.id,
                 toolName: toolName,
                 providerMetadata: nil,
-                providerExecuted: nil,
+                providerExecuted: true,
                 dynamic: nil,
                 title: nil
             ))
@@ -817,4 +862,91 @@ private func handleOutputItem(
             )))
         }
     }
+}
+
+private func xaiCodeExecutionInput(arguments: String?, code: String?) -> String {
+    if let arguments, !arguments.isEmpty {
+        return arguments
+    }
+    guard let code, !code.isEmpty else {
+        return ""
+    }
+    return xaiJSONString(from: .object(["code": .string(code)])) ?? ""
+}
+
+private func mapXAIWebSearchOutput(_ action: JSONValue?) -> JSONValue? {
+    guard let action, action != .null else {
+        return nil
+    }
+    guard case .object(let actionObject) = action,
+          case .string(let actionType)? = actionObject["type"] else {
+        return nil
+    }
+
+    switch actionType {
+    case "search":
+        var mappedAction: [String: JSONValue] = [
+            "type": .string("search")
+        ]
+        if case .string(let query)? = actionObject["query"] {
+            mappedAction["query"] = .string(query)
+        }
+
+        var result: [String: JSONValue] = [
+            "action": .object(mappedAction)
+        ]
+        if let sources = actionObject["sources"], sources != .null {
+            result["sources"] = sources
+        }
+        return .object(result)
+
+    case "open_page":
+        let urlValue = actionObject["url"] ?? .null
+        guard urlValue == .null || isJSONString(urlValue) else { return nil }
+        return .object([
+            "action": .object([
+                "type": .string("openPage"),
+                "url": urlValue
+            ])
+        ])
+
+    case "find_in_page":
+        let urlValue = actionObject["url"] ?? .null
+        let patternValue = actionObject["pattern"] ?? .null
+        guard (urlValue == .null || isJSONString(urlValue)),
+              (patternValue == .null || isJSONString(patternValue)) else {
+            return nil
+        }
+        return .object([
+            "action": .object([
+                "type": .string("findInPage"),
+                "url": urlValue,
+                "pattern": patternValue
+            ])
+        ])
+
+    default:
+        return nil
+    }
+}
+
+private func mapXAICodeExecutionOutput(_ outputs: JSONValue?) -> JSONValue? {
+    guard let outputs, outputs != .null else {
+        return nil
+    }
+    return .object(["outputs": outputs])
+}
+
+private func xaiJSONString(from value: JSONValue) -> String? {
+    guard let data = try? JSONEncoder().encode(value) else {
+        return nil
+    }
+    return String(data: data, encoding: .utf8)
+}
+
+private func isJSONString(_ value: JSONValue) -> Bool {
+    if case .string = value {
+        return true
+    }
+    return false
 }

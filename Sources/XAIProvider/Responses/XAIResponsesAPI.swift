@@ -140,6 +140,8 @@ public struct XAIResponsesToolCall: Codable, Sendable, Equatable {
     public let input: String?
     public let callId: String?
     public let action: JSONValue?
+    public let code: String?
+    public let outputs: JSONValue?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -152,6 +154,8 @@ public struct XAIResponsesToolCall: Codable, Sendable, Equatable {
         case input
         case callId = "call_id"
         case action
+        case code
+        case outputs
     }
 
     public init(from decoder: Decoder) throws {
@@ -166,6 +170,8 @@ public struct XAIResponsesToolCall: Codable, Sendable, Equatable {
         input = try container.decodeIfPresent(String.self, forKey: .input)
         callId = try container.decodeIfPresent(String.self, forKey: .callId)
         action = try container.decodeIfPresent(JSONValue.self, forKey: .action)
+        code = try container.decodeIfPresent(String.self, forKey: .code)
+        outputs = try container.decodeIfPresent(JSONValue.self, forKey: .outputs)
     }
 }
 
